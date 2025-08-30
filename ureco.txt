@@ -1,0 +1,331 @@
+Great—here’s the exact Prisma schema, idempotent fulfilment flow, and the Razorpay HMAC verifier you asked for, aligned to your PDFs (SKUs, durations, Solo/Duo, ₹ values, booking UI, success page). Prices/labels come from your Service page and Booking screens (e.g., Long Cycle 60-min Solo ₹4000; Duo ₹5300; slot list; “Book and Pay”; success meta).        
+
+1) Prisma schema (drop in prisma/schema.prisma)
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Cycle { HALF LONG FULL }
+enum Mode { SOLO DUO }
+enum OrderStatus { CREATED PAID FAILED CANCELLED }
+enum SlotStatus { AVAILABLE HELD SOLD }
+
+model Sku {
+  id           String   @id @default(cuid())              // e.g., "contrast.long.solo"
+  service      String                                    // "contrast"
+  cycle        Cycle
+  mode         Mode
+  durationMins Int                                       // 30 | 60 | 90
+  priceInr     Int                                       // e.g., 4000
+  displayTitle String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  orders   Order[]
+  slots    Slot[]   // optional: if you pre-generate capacity by sku
+}
+
+model Slot {
+  id        String   @id @default(cuid())
+  service   String
+  cycle     Cycle
+  mode      Mode
+  startAt   DateTime
+  endAt     DateTime
+  status    SlotStatus @default(AVAILABLE)
+  priceInr  Int
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  // Prevent double-booking the same “exact slot”
+  @@unique([service, cycle, mode, startAt, endAt])
+
+  booking Booking?
+}
+
+model Order {
+  id                 String      @id @default(cuid())
+  razorpayOrderId    String      @unique
+  skuId              String
+  slotId             String
+  amountInPaise      Int
+  currency           String      // "INR"
+  status             OrderStatus @default(CREATED)
+  purchaserEmail     String
+  purchaserPhone     String?
+  notes              Json?
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  sku     Sku   @relation(fields: [skuId], references: [id])
+  slot    Slot  @relation(fields: [slotId], references: [id])
+  booking Booking?
+
+  // Helpful lookup
+  @@index([skuId])
+  @@index([slotId])
+}
+
+model Booking {
+  id          String   @id @default(cuid())
+  orderId     String   @unique
+  slotId      String   @unique    // hard lock: one booking per Slot
+  service     String
+  cycle       Cycle
+  mode        Mode
+  durationMins Int
+  date        DateTime
+  amountInPaise Int
+  createdAt   DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+  slot  Slot  @relation(fields: [slotId], references: [id])
+}
+
+model WebhookEvent {
+  id         String   @id @default(cuid())
+  eventId    String   @unique        // from Razorpay payload
+  type       String
+  payload    Json
+  processedAt DateTime @default(now())
+}
+
+Seed SKUs (from your Service page)
+
+Use these to seed Sku so amounts are canonical in the backend (Claude reads from DB, never hardcodes):
+
+// prisma/seed.ts
+import { PrismaClient, Cycle, Mode } from '@prisma/client';
+const db = new PrismaClient();
+
+const skus = [
+  { service:'contrast', cycle: 'HALF', durationMins: 30, mode: 'SOLO', priceInr: 3000, displayTitle:'Half Cycle / Trial • Solo' },
+  { service:'contrast', cycle: 'HALF', durationMins: 30, mode: 'DUO',  priceInr: 4400, displayTitle:'Half Cycle / Trial • Duo' },
+  { service:'contrast', cycle: 'LONG', durationMins: 60, mode: 'SOLO', priceInr: 4000, displayTitle:'Long Cycle • Solo' },
+  { service:'contrast', cycle: 'LONG', durationMins: 60, mode: 'DUO',  priceInr: 5300, displayTitle:'Long Cycle • Duo' },
+  { service:'contrast', cycle: 'FULL', durationMins: 90, mode: 'SOLO', priceInr: 3000, displayTitle:'Full Cycle • Solo' }, // keep as per PDF
+  { service:'contrast', cycle: 'FULL', durationMins: 90, mode: 'DUO',  priceInr: 4400, displayTitle:'Full Cycle • Duo' },
+];
+await db.sku.createMany({ data: skus.map(s => ({...s, cycle: s.cycle as Cycle, mode: s.mode as Mode})) });
+
+(Values match your “Half/Long/Full” cards and Solo/Duo prices. Adjust later if the Full Cycle price was a placeholder; for now we mirror the PDF verbatim.  )
+
+2) Razorpay HMAC verifier (server-only, no secrets on client)
+
+Create src/lib/razorpay-verify.ts:
+
+import crypto from "crypto";
+
+export function verifyRazorpaySignature({
+  razorpay_order_id,
+  razorpay_payment_id,
+  razorpay_signature,
+}: {
+  razorpay_order_id: string;
+  razorpay_payment_id: string;
+  razorpay_signature: string;
+}) {
+  const secret = process.env.RAZORPAY_KEY_SECRET!;
+  const body = `${razorpay_order_id}|${razorpay_payment_id}`;
+  const expected = crypto.createHmac("sha256", secret).update(body).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(razorpay_signature));
+}
+
+3) Idempotent fulfilment transaction
+
+Goal: once a payment is valid (client verify or webhook), atomically mark the order paid, lock the slot, and create a booking exactly once.
+
+src/lib/fulfil.ts:
+
+import { PrismaClient, OrderStatus, SlotStatus } from "@prisma/client";
+const db = new PrismaClient();
+
+/**
+ * Idempotent fulfilment. Safe to call multiple times for the same order.
+ */
+export async function fulfilPaidOrder(razorpayOrderId: string, paymentMeta?: any) {
+  return await db.$transaction(async (tx) => {
+    const order = await tx.order.findUnique({ where: { razorpayOrderId } , include: { sku: true, slot: true }});
+    if (!order) throw new Error("Order not found");
+    if (order.status === OrderStatus.PAID) return order; // idempotent early-exit
+
+    // 1) Mark order PAID
+    await tx.order.update({
+      where: { id: order.id },
+      data: { status: OrderStatus.PAID, notes: paymentMeta ?? order.notes },
+    });
+
+    // 2) Lock slot (unique(slotId) on Booking + set Slot SOLD)
+    await tx.slot.update({
+      where: { id: order.slotId },
+      data: { status: SlotStatus.SOLD },
+    });
+
+    // 3) Create booking (unique on orderId and slotId prevents dupes)
+    await tx.booking.create({
+      data: {
+        orderId: order.id,
+        slotId: order.slotId,
+        service: order.sku.service,
+        cycle: order.sku.cycle,
+        mode: order.sku.mode,
+        durationMins: order.sku.durationMins,
+        date: order.slot.startAt,
+        amountInPaise: order.amountInPaise,
+      },
+    });
+
+    return order;
+  });
+}
+
+4) API routes (Next.js App Router)
+
+/api/orders – create Razorpay order (server)
+	•	Calculates amount from Sku (₹ → paise), persists Order(status=CREATED) with returned razorpayOrderId, and returns {orderId, amount, currency:"INR", key_id} to the client.
+
+// src/app/api/orders/route.ts
+import { PrismaClient } from "@prisma/client";
+const db = new PrismaClient();
+
+export async function POST(req: Request) {
+  const { skuId, slotId, email, phone } = await req.json();
+
+  const sku = await db.sku.findUnique({ where: { id: skuId } });
+  const slot = await db.slot.findUnique({ where: { id: slotId } });
+  if (!sku || !slot) return new Response("Invalid SKU/slot", { status: 400 });
+
+  const amountPaise = sku.priceInr * 100;
+  const rpOrder = await fetch("https://api.razorpay.com/v1/orders", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization:
+        "Basic " +
+        Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString("base64"),
+    },
+    body: JSON.stringify({
+      amount: amountPaise,
+      currency: "INR",
+      receipt: `ureco_${Date.now()}`,
+      notes: { skuId, slotId, email },
+    }),
+  }).then(r => r.json());
+
+  const order = await db.order.create({
+    data: {
+      razorpayOrderId: rpOrder.id,
+      skuId, slotId,
+      amountInPaise: amountPaise,
+      currency: "INR",
+      purchaserEmail: email, purchaserPhone: phone ?? null,
+      notes: rpOrder,
+    },
+  });
+
+  return Response.json({
+    localOrderId: order.id,
+    orderId: rpOrder.id,
+    amount: amountPaise,
+    currency: "INR",
+    key_id: process.env.RAZORPAY_KEY_ID,
+  });
+}
+
+/api/razorpay/verify – client callback verification
+
+// src/app/api/razorpay/verify/route.ts
+import { verifyRazorpaySignature } from "@/lib/razorpay-verify";
+import { fulfilPaidOrder } from "@/lib/fulfil";
+
+export async function POST(req: Request) {
+  const body = await req.json();
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = body;
+
+  if (!verifyRazorpaySignature({ razorpay_order_id, razorpay_payment_id, razorpay_signature })) {
+    return new Response("Bad signature", { status: 400 });
+  }
+  await fulfilPaidOrder(razorpay_order_id, { razorpay_payment_id });
+  return new Response("ok");
+}
+
+/api/razorpay/webhook – source-of-truth reconciliation (idempotent)
+
+// src/app/api/razorpay/webhook/route.ts
+import crypto from "crypto";
+import { PrismaClient } from "@prisma/client";
+import { fulfilPaidOrder } from "@/lib/fulfil";
+const db = new PrismaClient();
+
+function verifyHookSig(raw: string, sig: string) {
+  const h = crypto.createHmac("sha256", process.env.RAZORPAY_WEBHOOK_SECRET!);
+  h.update(raw);
+  const expected = h.digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig));
+}
+
+export async function POST(req: Request) {
+  const raw = await req.text();
+  const sig = req.headers.get("x-razorpay-signature") || "";
+  if (!verifyHookSig(raw, sig)) return new Response("bad sig", { status: 400 });
+
+  const event = JSON.parse(raw);
+  const eventId = event?.payload?.payment?.entity?.id || event?.id || `evt_${Date.now()}`;
+  try {
+    await db.webhookEvent.create({ data: { eventId, type: event.event, payload: event } });
+  } catch (_) { return new Response("dup", { status: 200 }); } // idempotent
+
+  // Handle both payment.captured and order.paid
+  const rpOrderId =
+    event?.payload?.order?.entity?.id ??
+    event?.payload?.payment?.entity?.order_id;
+
+  if (rpOrderId && (event.event === "payment.captured" || event.event === "order.paid")) {
+    await fulfilPaidOrder(rpOrderId, { hookEvent: event.event, eventId });
+  }
+  return new Response("ok", { status: 200 });
+}
+
+5) Client launch (hooks the “Book and Pay” button)
+
+Your booking UIs show duration, ₹4000, date (“5 August, 2025”), Solo/Duo toggle, and a primary CTA (“Book and Pay” / “Select a Slot”). This is the click path the code above powers.    
+
+// src/features/checkout/launch.ts
+export async function startCheckout({ skuId, slotId, email, phone }: { skuId:string; slotId:string; email:string; phone?:string }) {
+  const res = await fetch("/api/orders", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ skuId, slotId, email, phone }) });
+  const { localOrderId, orderId, amount, currency, key_id } = await res.json();
+
+  const rzp = new (window as any).Razorpay({
+    key: key_id,
+    order_id: orderId,
+    amount, currency,
+    prefill: { email, contact: phone },
+    handler: async (resp:any) => {
+      const ok = await fetch("/api/razorpay/verify", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(resp) });
+      window.location.href = ok.ok ? `/booking/success?id=${localOrderId}` : "/booking/failure";
+    },
+    theme: { color: "#000000" } // or from CSS variable
+  });
+  rzp.open();
+}
+
+6) What Claude Code should do next (Windsurf copy-prompts)
+	•	“Create Prisma models exactly as in prisma/schema.prisma, generate client, and add a seed for SKUs with prices/durations matching the PDFs.” (ref: Service pricing cards).  
+	•	“Implement /api/orders, /api/razorpay/verify, /api/razorpay/webhook with idempotent fulfilment using verifyRazorpaySignature() and fulfilPaidOrder() above.”
+	•	“Wire the Reserve page CTA so that when a slot is chosen it calls startCheckout(); ensure UI text/labels match ‘Book and Pay’, ‘Select a Slot’, and meta chips (60 Mins, Long Cycle, Solo/Duo) per design.”    
+	•	“Build the Success page to render the booked cycle (e.g., Long Cycle), 60 mins, date, SOLO, with ‘Download Order Summary’ and contact/map blocks as shown.”  
+
+7) Final hygiene checklist (don’t skip)
+	•	Amounts in paise; never trust the client—webhook is the SoT.
+	•	Unique constraints already enforce idempotency (slotId, order_id, eventId).
+	•	Add tests for HMAC verification and a transaction re-run (fulfil twice → one booking).
+	•	Keep secrets in env; never ship KEY_SECRET to the client.
+	•	Log + alert on verify/webhook failures; retry queues for emails.
+
+If you want, I can also drop a Playwright test that: creates an order (test key), simulates verify, and asserts one booking + slot SOLD; plus a seed for a sample slot inventory matching your “August 2025” grid so the calendar looks real in dev.
