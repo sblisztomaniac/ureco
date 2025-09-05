@@ -1,0 +1,13 @@
+Primary-Color - #FF2705
+Background-color- #0A0A0A
+Accent-color - #151413
+Gradient - #FF521C and #AE1800
+
+Primary Text - #FFFFFF
+Secondary Text - #E0E0E0
+Text Gray - #E9E9E9
+Footer Text - #FFD6CF
+
+Font - Addington CF
+File - /Font-Addington-CF.zip
+
